@@ -26,6 +26,8 @@ def main(page: ft.Page):
     quiz_score = 0          
     quiz_answered = False   
     quiz_explanation_shown = False 
+    
+    summary_mode = False
 
     deck_dropdown = ft.Dropdown(label="Select a Deck", width=300, color=text_color)
     card_counter = ft.Text(value="", size=14, color=accent_color, weight=ft.FontWeight.W_600, text_align=ft.TextAlign.CENTER)
@@ -117,6 +119,38 @@ def main(page: ft.Page):
         ),
         width=600, height=550, bgcolor=card_color, border_radius=20, padding=40,
         alignment=ft.Alignment(0, 0), shadow=ft.BoxShadow(spread_radius=2, blur_radius=15, color="#000000")
+    )
+
+    summary_markdown = ft.Markdown(value="", selectable=True, extension_set=ft.MarkdownExtensionSet.GITHUB_WEB)
+    summary_progress_ring = ft.ProgressRing(visible=False, color=accent_color)
+    summary_loading_text = ft.Text(value="", color=accent_color, size=16, weight=ft.FontWeight.W_600)
+    
+    def on_back_to_study_click(e):
+        toggle_summary_mode(e)
+        
+    summary_back_btn = ft.FilledButton(
+        content=ft.Text("Back to Study"),
+        on_click=on_back_to_study_click,
+        style=ft.ButtonStyle(bgcolor=accent_color, color=bg_color)
+    )
+
+    summary_view_container = ft.Container(
+        content=ft.Column(
+            [
+                summary_loading_text,
+                summary_progress_ring,
+                summary_markdown,
+                ft.Container(height=20),
+                summary_back_btn
+            ],
+            alignment=ft.MainAxisAlignment.START,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=10,
+            scroll=ft.ScrollMode.AUTO
+        ),
+        width=600, height=550, bgcolor=card_color, border_radius=20, padding=40,
+        alignment=ft.Alignment(0, -1), shadow=ft.BoxShadow(spread_radius=2, blur_radius=15, color="#000000"),
+        visible=False
     )
 
     file_picker = ft.FilePicker()
@@ -293,9 +327,10 @@ def main(page: ft.Page):
         page.update()
 
     def toggle_quiz_mode(e):
-        nonlocal quiz_mode, quiz_data, current_quiz_index, quiz_score, quiz_answered, quiz_explanation_shown
+        nonlocal quiz_mode, quiz_data, current_quiz_index, quiz_score, quiz_answered, quiz_explanation_shown, summary_mode
         quiz_mode = not quiz_mode
         if quiz_mode:
+            summary_mode = False
             quiz_data = []
             current_quiz_index = 0
             quiz_score = 0
@@ -329,6 +364,70 @@ def main(page: ft.Page):
             controls_row.visible = True
             srs_row.visible = not is_front 
             quiz_view_container.visible = False
+        page.update()
+
+    def toggle_summary_mode(e):
+        nonlocal summary_mode, quiz_mode
+        summary_mode = not summary_mode
+        if summary_mode:
+            quiz_mode = False
+            card_container.visible = False
+            controls_row.visible = False
+            srs_row.visible = False
+            quiz_view_container.visible = False
+            summary_view_container.visible = True
+            
+            summary_markdown.value = ""
+            summary_loading_text.value = ""
+            
+            page.run_task(fetch_or_generate_summary)
+        else:
+            summary_view_container.visible = False
+            card_container.visible = True
+            controls_row.visible = True
+            srs_row.visible = not is_front
+            
+        page.update()
+
+    async def fetch_or_generate_summary(e=None):
+        deck_id = deck_dropdown.value
+        if not deck_id:
+            summary_markdown.value = "Please select a deck first."
+            page.update()
+            return
+            
+        summary_progress_ring.visible = True
+        summary_loading_text.value = "Fetching cheat sheet..."
+        summary_back_btn.disabled = True
+        page.update()
+        
+        try:
+            response = requests.get(f"{API_BASE}/decks/{deck_id}/summary")
+            if response.status_code == 200:
+                summary_markdown.value = response.json().get("markdown_content", "")
+                summary_loading_text.value = ""
+            elif response.status_code == 404:
+                summary_loading_text.value = "Drafting executive summary...\nThis may take a minute."
+                page.update()
+                
+                await asyncio.sleep(0.1)
+                
+                gen_resp = requests.post(f"{API_BASE}/decks/{deck_id}/generate-summary")
+                if gen_resp.status_code == 200:
+                    summary_markdown.value = gen_resp.json().get("markdown_content", "")
+                    summary_loading_text.value = ""
+                else:
+                    summary_markdown.value = f"Error generating: {gen_resp.status_code} - {gen_resp.text}"
+                    summary_loading_text.value = ""
+            else:
+                summary_markdown.value = f"Backend Error: {response.status_code}"
+                summary_loading_text.value = ""
+        except Exception as err:
+            summary_markdown.value = f"App Error: {err}"
+            summary_loading_text.value = ""
+            
+        summary_progress_ring.visible = False
+        summary_back_btn.disabled = False
         page.update()
 
     async def generate_quiz_clicked(e):
@@ -473,16 +572,51 @@ def main(page: ft.Page):
         alignment=ft.MainAxisAlignment.CENTER, spacing=15, visible=False
     )
 
-    row1_controls = ft.Row([deck_dropdown, delete_btn, load_btn, quiz_toggle_btn], alignment=ft.MainAxisAlignment.CENTER, spacing=15)
+    cheat_sheet_btn = ft.FilledButton(content=ft.Text("Cheat Sheet"), icon=ft.Icons.ARTICLE, on_click=toggle_summary_mode, style=ft.ButtonStyle(bgcolor="#4A4036", color=text_color))
+    row1_controls = ft.Row([deck_dropdown, delete_btn, load_btn, quiz_toggle_btn, cheat_sheet_btn], alignment=ft.MainAxisAlignment.CENTER, spacing=15)
 
     quiz_generate_btn.on_click = generate_quiz_clicked
 
+    focus_trap = ft.TextField(width=1, height=1, border=ft.InputBorder.NONE, color=ft.Colors.TRANSPARENT, bgcolor=ft.Colors.TRANSPARENT, cursor_color=ft.Colors.TRANSPARENT)
+
+    async def on_keyboard(e: ft.KeyboardEvent):
+        handled = False
+        if e.key == " " or e.key == "Space":
+            if not quiz_mode and not summary_mode and current_cards:
+                flip_card()
+                handled = True
+        elif e.key == "Arrow Right" or e.key == "Enter":
+            if not quiz_mode and not summary_mode:
+                next_card(None)
+                handled = True
+            elif quiz_mode and not summary_mode and quiz_next_btn.visible:
+                next_quiz_clicked(None)
+                handled = True
+        elif e.key == "Arrow Left":
+            if not quiz_mode and not summary_mode:
+                prev_card(None)
+                handled = True
+        elif e.key in ["1", "2", "3", "4"]:
+            if quiz_mode and not quiz_answered and quiz_options_col.visible:
+                option_index = int(e.key) - 1
+                check_answer(option_index)
+                handled = True
+                
+        if handled:
+            try:
+                await focus_trap.focus()
+            except Exception:
+                pass
+
+    page.on_keyboard_event = on_keyboard
+
     page.add(
+        focus_trap,
         row1_controls,
         ft.Container(height=10),
         ft.Row([slider_container, upload_btn], alignment=ft.MainAxisAlignment.CENTER, spacing=20),
         ft.Container(height=20),
-        ft.Stack([card_container, quiz_view_container]),
+        ft.Stack([card_container, quiz_view_container, summary_view_container]),
         ft.Container(height=30),
         controls_row,
         srs_row

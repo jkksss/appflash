@@ -22,7 +22,8 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS decks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL
+            name TEXT NOT NULL,
+            source_text TEXT
         )
     ''')
     # Added ease_factor, interval, and repetitions to track study history
@@ -51,6 +52,22 @@ def init_db():
             FOREIGN KEY (deck_id) REFERENCES decks(id)
         )
     ''')
+    # Create summaries table for AI Cheat Sheet
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            deck_id INTEGER,
+            markdown_content TEXT NOT NULL,
+            FOREIGN KEY (deck_id) REFERENCES decks(id)
+        )
+    ''')
+    
+    # Safely try adding source_text to existing decks table if it's missing
+    try:
+        cursor.execute("ALTER TABLE decks ADD COLUMN source_text TEXT")
+    except sqlite3.OperationalError:
+        pass
+        
     conn.commit()
     conn.close()
 
@@ -115,6 +132,33 @@ async def get_due_cards(deck_id: int):
     conn.close()
     return {"due_cards": cards}
 
+def chunk_text(text: str, chunk_size: int = 4000) -> list[str]:
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        if end >= len(text):
+            chunks.append(text[start:])
+            break
+        newline_pos = text.rfind('\n', start, end)
+        if newline_pos != -1 and newline_pos > start:
+            chunks.append(text[start:newline_pos].strip())
+            start = newline_pos + 1
+        else:
+            chunks.append(text[start:end].strip())
+            start = end
+    return [c for c in chunks if c]
+
+def distribute_cards(total_cards: int, num_chunks: int) -> list[int]:
+    if num_chunks == 0:
+        return []
+    base_count = total_cards // num_chunks
+    remainder = total_cards % num_chunks
+    distribution = [base_count] * num_chunks
+    for i in range(remainder):
+        distribution[i] += 1
+    return distribution
+
 @app.post("/upload/")
 async def upload_pdf(file: UploadFile = File(...), count: int = 15):
     file_location = f"temp_{file.filename}"
@@ -137,62 +181,85 @@ async def upload_pdf(file: UploadFile = File(...), count: int = 15):
     if not extracted_text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from PDF")
 
-    base_prompt = f"""
-    Extract highly detailed, granular flashcards from the following text.
-    DO NOT summarize or group distinct concepts together.
-    Create exactly {count} flashcards (or as many as the text supports if it's too short).
-    Generate an individual card for every key term, specific definition, and distinct process found in the text.
+    chunks = chunk_text(extracted_text, 4000)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No usable text found after chunking.")
 
-    Return ONLY a valid JSON array of objects. Each object must have exactly two keys: 'front' and 'back'. Do not include markdown code blocks like ```json.
+    card_counts = distribute_cards(count, len(chunks))
+    master_cards_data = []
 
-    Text:
-    {extracted_text}
-    """
+    for i, chunk in enumerate(chunks):
+        cards_requested = card_counts[i]
+        if cards_requested == 0:
+            continue
+            
+        base_prompt = f"""
+        Extract highly detailed, granular flashcards from the following text.
+        DO NOT summarize or group distinct concepts together.
+        Create exactly {cards_requested} flashcards (or as many as the text supports if it's too short).
+        Generate an individual card for every key term, specific definition, and distinct process found in the text.
 
-    cards_data = []
+        Return ONLY a valid JSON array of objects. Each object must have exactly two keys: 'front' and 'back'. Do not include markdown code blocks like ```json.
 
-    # PRIMARY ENGINE: Gemini -> FALLBACK: Groq
-    try:
-        if not GEMINI_API_KEY:
-            raise ValueError("GEMINI_API_KEY is not set in .env")
-
-        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-        response = gemini_client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=base_prompt
-        )
-        raw_json = response.text.replace('```json', '').replace('```', '').strip()
-        cards_data = json.loads(raw_json)
-        print("Successfully generated cards via Gemini!")
-
-    except Exception as e:
-        print(f"Gemini failed: {e}. Routing to Groq fallback...")
+        Text:
+        {chunk}
+        """
+        
+        chunk_cards = []
         try:
-            if not GROQ_API_KEY:
-                raise ValueError("GROQ_API_KEY is not set in .env")
+            if not GEMINI_API_KEY:
+                raise ValueError("GEMINI_API_KEY is not set in .env")
 
-            groq_client = Groq(api_key=GROQ_API_KEY)
-            chat_completion = groq_client.chat.completions.create(
-                messages=[{"role": "user", "content": base_prompt}],
-                model="groq/compound",
-                temperature=0.3
+            gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+            response = gemini_client.models.generate_content(
+                model='gemini-3.6-flash',
+                contents=base_prompt
             )
-            raw_json = chat_completion.choices[0].message.content.replace('```json', '').replace('```', '').strip()
-            cards_data = json.loads(raw_json)
-            print("Successfully generated cards via Groq!")
-        except Exception as groq_err:
-            raise HTTPException(status_code=500, detail=f"Both AI engines failed. Groq error: {groq_err}")
+            raw_json = response.text.replace('```json', '').replace('```', '').strip()
+            chunk_cards = json.loads(raw_json)
+            print(f"Successfully generated cards for chunk {i+1} via Gemini!")
+        except Exception as e:
+            print(f"Gemini failed for chunk {i+1}: {e}. Routing to Groq fallback...")
+            try:
+                if not GROQ_API_KEY:
+                    raise ValueError("GROQ_API_KEY is not set in .env")
 
-    if not isinstance(cards_data, list):
-        raise HTTPException(status_code=500, detail="AI did not return a valid array.")
+                groq_client = Groq(api_key=GROQ_API_KEY)
+                chat_completion = groq_client.chat.completions.create(
+                    messages=[{"role": "user", "content": base_prompt}],
+                    model="groq/compound",
+                    temperature=0.3
+                )
+                raw_json = chat_completion.choices[0].message.content.replace('```json', '').replace('```', '').strip()
+                chunk_cards = json.loads(raw_json)
+                print(f"Successfully generated cards for chunk {i+1} via Groq!")
+            except Exception as groq_err:
+                print(f"Both AI engines failed for chunk {i+1}. Groq error: {groq_err}")
+                continue # Do not crash, move to next chunk
+        
+        if isinstance(chunk_cards, list):
+            master_cards_data.extend(chunk_cards)
+        else:
+            print(f"AI did not return a valid array for chunk {i+1}.")
+
+    if not master_cards_data:
+        raise HTTPException(status_code=500, detail="Failed to generate any flashcards from the provided text.")
 
     # Save to Database
     conn = sqlite3.connect("flashcards.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO decks (name) VALUES (?)", (file.filename,))
+    
+    try:
+        cursor.execute("INSERT INTO decks (name, source_text) VALUES (?, ?)", (file.filename, extracted_text))
+    except sqlite3.OperationalError:
+        cursor.execute("ALTER TABLE decks ADD COLUMN source_text TEXT")
+        cursor.execute("INSERT INTO decks (name, source_text) VALUES (?, ?)", (file.filename, extracted_text))
+        
     deck_id = cursor.lastrowid
 
-    for card in cards_data:
+    for card in master_cards_data:
+        if not isinstance(card, dict):
+            continue
         front = card.get("front", "No Front")
         back = card.get("back", "No Back")
         cursor.execute("INSERT INTO cards (deck_id, front, back) VALUES (?, ?, ?)", (deck_id, front, back))
@@ -200,7 +267,7 @@ async def upload_pdf(file: UploadFile = File(...), count: int = 15):
     conn.commit()
     conn.close()
 
-    return {"message": "Upload successful", "deck_id": deck_id, "cards_generated": len(cards_data)}
+    return {"message": "Upload successful", "deck_id": deck_id, "cards_generated": len(master_cards_data)}
 
 @app.get("/decks/")
 async def get_decks():
@@ -378,3 +445,74 @@ async def generate_quiz(deck_id: int, count: int = 5):
         raise HTTPException(status_code=500, detail="Failed to generate valid quiz questions")
 
     return {"message": f"Generated {saved_count} quiz questions successfully", "count": saved_count}
+
+@app.get("/decks/{deck_id}/summary")
+async def get_summary(deck_id: int):
+    conn = sqlite3.connect("flashcards.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT markdown_content FROM summaries WHERE deck_id = ?", (deck_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Summary not found")
+    return {"markdown_content": row[0]}
+
+@app.post("/decks/{deck_id}/generate-summary")
+async def generate_summary(deck_id: int):
+    conn = sqlite3.connect("flashcards.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT source_text FROM decks WHERE id = ?", (deck_id,))
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Source text not found for this deck")
+    
+    source_text = row[0]
+    
+    base_prompt = f"""
+    Create a comprehensive, highly structured Markdown cheat sheet based on the following text.
+    Use headers, bullet points, and bold text for key terms. Include code blocks if applicable.
+    Provide a high-level executive summary before diving into the individual topics.
+    
+    Text:
+    {source_text[:30000]}
+    """
+    
+    markdown_content = ""
+    try:
+        if not GEMINI_API_KEY:
+            raise ValueError("GEMINI_API_KEY is not set")
+            
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        response = gemini_client.models.generate_content(
+            model='gemini-3.6-flash',
+            contents=base_prompt
+        )
+        markdown_content = response.text.strip()
+    except Exception as e:
+        print(f"Gemini failed for summary: {e}. Routing to Groq fallback...")
+        try:
+            if not GROQ_API_KEY:
+                raise ValueError("GROQ_API_KEY is not set")
+                
+            groq_client = Groq(api_key=GROQ_API_KEY)
+            chat_completion = groq_client.chat.completions.create(
+                messages=[{"role": "user", "content": base_prompt}],
+                model="groq/compound",
+                temperature=0.3
+            )
+            markdown_content = chat_completion.choices[0].message.content.strip()
+        except Exception as groq_err:
+            conn.close()
+            raise HTTPException(status_code=500, detail=f"Both AI engines failed. Groq error: {groq_err}")
+            
+    if not markdown_content:
+        conn.close()
+        raise HTTPException(status_code=500, detail="Generated summary is empty")
+        
+    cursor.execute("DELETE FROM summaries WHERE deck_id = ?", (deck_id,))
+    cursor.execute("INSERT INTO summaries (deck_id, markdown_content) VALUES (?, ?)", (deck_id, markdown_content))
+    conn.commit()
+    conn.close()
+    
+    return {"message": "Summary generated successfully", "markdown_content": markdown_content}
